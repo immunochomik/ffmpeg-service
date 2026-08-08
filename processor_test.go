@@ -128,7 +128,7 @@ func TestConvertProbedFeedsPredictorAndMetrics(t *testing.T) {
 	if !calibrated || prediction.Duration <= 0 || prediction.Samples != 1 {
 		t.Fatalf("unexpected prediction: %+v", prediction)
 	}
-	if !metrics.Successful || metrics.AudioType != AudioType(inputInfo) || metrics.AudioDuration != 0.01 || metrics.ProcessingDuration <= 0 || metrics.TotalDuration < metrics.ProcessingDuration {
+	if !metrics.Successful || metrics.AudioType != inputInfo.AudioType() || metrics.AudioDuration != 0.01 || metrics.ProcessingDuration <= 0 || metrics.TotalDuration < metrics.ProcessingDuration {
 		t.Fatalf("unexpected metrics: %+v", metrics)
 	}
 }

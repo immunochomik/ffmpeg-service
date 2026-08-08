@@ -192,7 +192,7 @@ func (processor *Processor) PredictConvert(inputInfo ProbeResult) (Prediction, b
 	if processor == nil || processor.predictor == nil {
 		return Prediction{}, false
 	}
-	prediction := processor.predictor.Predict(AudioType(inputInfo), inputInfo.Duration)
+	prediction := processor.predictor.Predict(inputInfo.AudioType(), inputInfo.Duration)
 	return prediction, prediction.Calibrated
 }
 
@@ -201,7 +201,7 @@ func (processor *Processor) convertWithInfo(ctx context.Context, input io.Reader
 		return ProbeResult{}, errors.New("ffmpeg: nil input or output")
 	}
 	totalStarted := time.Now()
-	audioType := AudioType(inputInfo)
+	audioType := inputInfo.AudioType()
 	measurement := processor.predictor.Begin(audioType)
 	var acquireDuration, processingDuration time.Duration
 	defer func() {
@@ -259,10 +259,10 @@ func (processor *Processor) convertWithInfo(ctx context.Context, input io.Reader
 	return result, nil
 }
 
-// AudioType creates a bounded-cardinality model key from the properties that
-// most strongly influence decoder cost. Container aliases are kept together as
-// reported by ffprobe; the predictor's LRU cap bounds unusual combinations.
-func AudioType(info ProbeResult) string {
+// AudioType creates a model key from the properties that most strongly
+// influence decoder cost. Container aliases are kept together as reported by
+// ffprobe; the predictor's LRU cap bounds unusual combinations.
+func (info ProbeResult) AudioType() string {
 	container := strings.ToLower(strings.TrimSpace(info.FormatName))
 	codec := strings.ToLower(strings.TrimSpace(info.codecName))
 	if container == "" && codec == "" {
