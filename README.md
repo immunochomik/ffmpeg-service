@@ -34,16 +34,16 @@ import (
 )
 
 func process(ctx context.Context, input io.Reader) error {
-	p, err := ffmpeg.NewProcessor(ctx, ffmpeg.Config{
+	processor, err := ffmpeg.NewProcessor(ctx, ffmpeg.Config{
 		FFprobePoolSize: 2,
 		FFmpegPoolSize:  4,
 	})
 	if err != nil {
 		return err
 	}
-	defer p.Close()
+	defer processor.Close()
 
-	info, original, err := p.Probe(ctx, input)
+	info, original, err := processor.Probe(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -54,17 +54,19 @@ func process(ctx context.Context, input io.Reader) error {
 		return nil
 	}
 
-	if ffmpeg.IsTargetFormat(info) {
+	if processor.IsTargetFormat(info) {
 		_, err = io.Copy(os.Stdout, original)
 		return err
 	}
 
 	var pcm bytes.Buffer
-	if err := p.Convert(ctx, original, &pcm); err != nil {
+	converted, err := processor.Convert(ctx, original, &pcm)
+	if err != nil {
 		return err
 	}
 
 	// pcm contains mono, 16 kHz, signed 16-bit little-endian raw PCM.
+	_ = converted // Metadata describing pcm.
 	return nil
 }
 ```
@@ -73,6 +75,24 @@ func process(ctx context.Context, input io.Reader) error {
 consumed while probing are buffered and replayed before unread bytes from the
 provided reader. Callers should consume the returned reader instead of
 continuing to read directly from the original reader.
+
+Both `Probe` and `Convert` return normalized metadata:
+
+```go
+type ProbeResult struct {
+	Duration          float64 `json:"duration"`
+	NumChannels       int     `json:"num_channels"`
+	StreamIDs         []int   `json:"stream_ids"`
+	FormatName        string  `json:"format_name"`
+	SampleRate        int     `json:"sample_rate"`
+	DurationEstimated bool    `json:"duration_estimated"`
+}
+```
+
+`Probe` prefers duration metadata reported by ffprobe. `Convert` calculates an
+exact duration from the number of emitted PCM samples for recognizable raw PCM
+and PCM WAV targets. For target formats whose duration cannot be derived from
+the output, duration is zero.
 
 ## Container policy
 
