@@ -5,6 +5,7 @@ package ffmpeg
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -180,7 +181,7 @@ func (processor *Processor) Convert(ctx context.Context, input io.Reader, output
 	stopCancel()
 	processor.convert.finished(process)
 	writeErr := <-copyErr
-	result := processor.target.result(countedOutput.written)
+	result := processor.target.result(countedOutput.written, countedOutput.prefix)
 	if outputErr != nil {
 		return result, fmt.Errorf("read ffmpeg output: %w", outputErr)
 	}
@@ -292,13 +293,13 @@ func normalizeProbeInfo(info probeInfo, inputBytes int64) ProbeResult {
 		}
 	}
 	if result.Duration == 0 {
-		result.Duration = pcmDuration(inputBytes, result.codecName, result.NumChannels, result.SampleRate)
+		result.Duration = pcmDuration(inputBytes, nil, result.FormatName, result.codecName, result.NumChannels, result.SampleRate)
 		result.DurationEstimated = result.Duration > 0
 	}
 	return result
 }
 
-func (target outputFormat) result(outputBytes int64) ProbeResult {
+func (target outputFormat) result(outputBytes int64, outputPrefix []byte) ProbeResult {
 	result := ProbeResult{
 		NumChannels: target.channels,
 		StreamIDs:   []int{0},
@@ -306,12 +307,24 @@ func (target outputFormat) result(outputBytes int64) ProbeResult {
 		SampleRate:  target.sampleRate,
 		codecName:   target.codec,
 	}
-	result.Duration = pcmDuration(outputBytes, target.codec, target.channels, target.sampleRate)
-	result.DurationEstimated = result.Duration > 0
+	result.Duration = pcmDuration(outputBytes, outputPrefix, target.container, target.codec, target.channels, target.sampleRate)
 	return result
 }
 
-func pcmDuration(byteCount int64, codec string, channels, sampleRate int) float64 {
+// pcmDuration derives duration from the PCM payload size: bytes / (sample rate
+// * channels * bytes per sample). Raw PCM uses the complete output size; WAV
+// uses only bytes following its data-chunk header.
+func pcmDuration(byteCount int64, prefix []byte, container, codec string, channels, sampleRate int) float64 {
+	payloadBytes := byteCount
+	if isWAVContainer(container) {
+		dataOffset, ok := wavDataOffset(prefix)
+		if !ok || byteCount < int64(dataOffset) {
+			return 0
+		}
+		payloadBytes -= int64(dataOffset)
+	} else if !isRawPCMContainer(container) {
+		return 0
+	}
 	bits := 0
 	if strings.HasPrefix(codec, "pcm_s") || strings.HasPrefix(codec, "pcm_u") || strings.HasPrefix(codec, "pcm_f") {
 		for _, width := range []int{8, 16, 24, 32, 64} {
@@ -321,20 +334,61 @@ func pcmDuration(byteCount int64, codec string, channels, sampleRate int) float6
 			}
 		}
 	}
-	if byteCount <= 0 || bits == 0 || channels <= 0 || sampleRate <= 0 {
+	if payloadBytes <= 0 || bits == 0 || channels <= 0 || sampleRate <= 0 {
 		return 0
 	}
-	return float64(byteCount) / float64(bits/8*channels*sampleRate)
+	return float64(payloadBytes) / float64(bits/8*channels*sampleRate)
+}
+
+func isWAVContainer(container string) bool {
+	return strings.EqualFold(container, "wav")
+}
+
+func wavDataOffset(data []byte) (int, bool) {
+	if len(data) < 12 || (string(data[:4]) != "RIFF" && string(data[:4]) != "RF64") || string(data[8:12]) != "WAVE" {
+		return 0, false
+	}
+	for offset := 12; offset+8 <= len(data); {
+		chunkSize := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		if string(data[offset:offset+4]) == "data" {
+			return offset + 8, true
+		}
+		next := offset + 8 + chunkSize + chunkSize%2
+		if next <= offset || next > len(data) {
+			return 0, false
+		}
+		offset = next
+	}
+	return 0, false
+}
+
+func isRawPCMContainer(container string) bool {
+	switch strings.ToLower(container) {
+	case "s8", "u8", "s16le", "s16be", "u16le", "u16be",
+		"s24le", "s24be", "u24le", "u24be", "s32le", "s32be",
+		"u32le", "u32be", "f32le", "f32be", "f64le", "f64be":
+		return true
+	default:
+		return false
+	}
 }
 
 type countingWriter struct {
 	writer  io.Writer
 	written int64
+	prefix  []byte
 }
 
 func (output *countingWriter) Write(data []byte) (int, error) {
 	written, err := output.writer.Write(data)
 	output.written += int64(written)
+	const prefixLimit = 64 << 10
+	if remaining := prefixLimit - len(output.prefix); remaining > 0 {
+		if written < remaining {
+			remaining = written
+		}
+		output.prefix = append(output.prefix, data[:remaining]...)
+	}
 	return written, err
 }
 

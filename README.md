@@ -89,11 +89,10 @@ type ProbeResult struct {
 }
 ```
 
-`Probe` prefers duration metadata reported by ffprobe. `Convert` calculates
-duration from the number of emitted PCM samples when the configured target is
-a recognizable raw PCM codec, and marks that duration as estimated. For target
-formats whose duration cannot be derived from output byte count, duration is
-zero.
+`Probe` prefers duration metadata reported by ffprobe. `Convert` calculates an
+exact duration from the number of emitted PCM samples for recognizable raw PCM
+and PCM WAV targets. For target formats whose duration cannot be derived from
+the output, duration is zero.
 
 ## Container policy
 

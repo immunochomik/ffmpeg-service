@@ -81,8 +81,29 @@ func TestConvert(t *testing.T) {
 	if want := 160 * 2; out.Len() != want {
 		t.Fatalf("got %d PCM bytes, want %d", out.Len(), want)
 	}
-	if result.FormatName != "s16le" || result.NumChannels != 1 || result.SampleRate != 16000 || result.Duration != 0.01 || !result.DurationEstimated {
+	if result.FormatName != "s16le" || result.NumChannels != 1 || result.SampleRate != 16000 || result.Duration != 0.01 || result.DurationEstimated {
 		t.Fatalf("unexpected conversion result: %+v", result)
+	}
+}
+
+func TestConvertWAVDuration(t *testing.T) {
+	requireFFmpeg(t)
+	processor, err := NewProcessor(context.Background(), Config{FFmpegArgs: []string{
+		"-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+		"-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "wav", "pipe:1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processor.Close()
+
+	var output bytes.Buffer
+	result, err := processor.Convert(context.Background(), bytes.NewReader(tinyWAV()), &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FormatName != "wav" || result.Duration != 0.01 || result.DurationEstimated {
+		t.Fatalf("unexpected WAV conversion result: %+v", result)
 	}
 }
 
@@ -120,6 +141,16 @@ func TestIsTargetFormatUsesConfiguredArgs(t *testing.T) {
 	info = ProbeResult{FormatName: "s16le", codecName: "pcm_s16le", NumChannels: 1, SampleRate: 16000}
 	if processor.IsTargetFormat(info) {
 		t.Fatal("hard-coded default target was recognized for custom args")
+	}
+}
+
+func TestRawPCMDuration(t *testing.T) {
+	if duration := pcmDuration(32000, nil, "s16le", "pcm_s16le", 1, 16000); duration != 1 {
+		t.Fatalf("got duration %v, want 1", duration)
+	}
+	wav := tinyWAV()
+	if duration := pcmDuration(int64(len(wav)), wav, "wav", "pcm_s16le", 1, 16000); duration != 0.01 {
+		t.Fatalf("got WAV duration %v, want 0.01", duration)
 	}
 }
 
