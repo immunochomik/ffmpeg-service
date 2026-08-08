@@ -29,9 +29,21 @@ type Config struct {
 	FFprobeArgs []string
 }
 
-type Info struct {
+type probeInfo struct {
 	Format  FormatInfo   `json:"format"`
 	Streams []StreamInfo `json:"streams"`
+}
+
+// ProbeResult is the normalized audio metadata returned by Probe and Convert.
+type ProbeResult struct {
+	Duration          float64 `json:"duration"`
+	NumChannels       int     `json:"num_channels"`
+	StreamIDs         []int   `json:"stream_ids"`
+	FormatName        string  `json:"format_name"`
+	SampleRate        int     `json:"sample_rate"`
+	DurationEstimated bool    `json:"duration_estimated"`
+
+	codecName string
 }
 
 type FormatInfo struct {
@@ -40,10 +52,6 @@ type FormatInfo struct {
 	Duration string            `json:"duration"`
 	BitRate  string            `json:"bit_rate"`
 	Tags     map[string]string `json:"tags"`
-}
-
-func (f FormatInfo) DurationSeconds() (float64, error) {
-	return strconv.ParseFloat(f.Duration, 64)
 }
 
 type StreamInfo struct {
@@ -59,6 +67,7 @@ type StreamInfo struct {
 type Processor struct {
 	probe     *processPool
 	convert   *processPool
+	target    outputFormat
 	closeOnce sync.Once
 }
 
@@ -70,10 +79,10 @@ func NewProcessor(ctx context.Context, cfg Config) (*Processor, error) {
 		return nil, errors.New("ffmpeg: pool sizes must be non-negative")
 	}
 	if cfg.FFmpegPoolSize == 0 {
-		cfg.FFmpegPoolSize = 1
+		cfg.FFmpegPoolSize = 5
 	}
 	if cfg.FFprobePoolSize == 0 {
-		cfg.FFprobePoolSize = 1
+		cfg.FFprobePoolSize = 5
 	}
 	if cfg.FFmpegCommand == "" {
 		cfg.FFmpegCommand = "ffmpeg"
@@ -96,102 +105,107 @@ func NewProcessor(ctx context.Context, cfg Config) (*Processor, error) {
 		probe.close()
 		return nil, fmt.Errorf("start ffmpeg pool: %w", err)
 	}
-	return &Processor{probe: probe, convert: convert}, nil
+	return &Processor{probe: probe, convert: convert, target: parseOutputFormat(cfg.FFmpegArgs)}, nil
 }
 
-func (p *Processor) Probe(ctx context.Context, input io.Reader) (Info, io.Reader, error) {
+func (processor *Processor) Probe(ctx context.Context, input io.Reader) (ProbeResult, io.Reader, error) {
 	if input == nil {
-		return Info{}, nil, errors.New("ffmpeg: nil input")
+		return ProbeResult{}, nil, errors.New("ffmpeg: nil input")
 	}
-	proc, err := p.probe.acquire(ctx)
+	process, err := processor.probe.acquire(ctx)
 	if err != nil {
-		return Info{}, input, err
+		return ProbeResult{}, input, err
 	}
-	stopCancel := proc.watch(ctx)
+	stopCancel := process.watch(ctx)
 	var saved bytes.Buffer
 	copyErr := make(chan error, 1)
 	go func() {
-		_, e := io.Copy(proc.stdin, io.TeeReader(input, &saved))
-		if ce := proc.stdin.Close(); e == nil {
-			e = ce
+		// ffprobe consumes part or all of the non-seekable input. Tee those
+		// bytes into saved so Probe can return saved + the unread remainder as
+		// one reader representing the complete original stream.
+		_, copyError := io.Copy(process.stdin, io.TeeReader(input, &saved))
+		if closeError := process.stdin.Close(); copyError == nil {
+			copyError = closeError
 		}
-		copyErr <- e
+		copyErr <- copyError
 	}()
-	var info Info
-	decodeErr := json.NewDecoder(proc.stdout).Decode(&info)
-	_, _ = io.Copy(io.Discard, proc.stdout)
-	waitErr := proc.wait()
+	var info probeInfo
+	decodeErr := json.NewDecoder(process.stdout).Decode(&info)
+	_, _ = io.Copy(io.Discard, process.stdout)
+	waitErr := process.wait()
 	stopCancel()
-	p.probe.finished(proc)
+	processor.probe.finished(process)
 	writeErr := <-copyErr
 	original := io.MultiReader(bytes.NewReader(saved.Bytes()), input)
 	if ctx.Err() != nil {
-		return Info{}, original, ctx.Err()
+		return ProbeResult{}, original, ctx.Err()
 	}
 	if decodeErr != nil {
-		return Info{}, original, fmt.Errorf("decode ffprobe output: %w%s", decodeErr, proc.stderrSuffix())
+		return ProbeResult{}, original, fmt.Errorf("decode ffprobe output: %w%s", decodeErr, process.stderrSuffix())
 	}
 	if waitErr != nil {
-		return Info{}, original, fmt.Errorf("ffprobe: %w%s", waitErr, proc.stderrSuffix())
+		return ProbeResult{}, original, fmt.Errorf("ffprobe: %w%s", waitErr, process.stderrSuffix())
 	}
 	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
-		return Info{}, original, fmt.Errorf("write ffprobe input: %w", writeErr)
+		return ProbeResult{}, original, fmt.Errorf("write ffprobe input: %w", writeErr)
 	}
-	return info, original, nil
+	return normalizeProbeInfo(info, int64(saved.Len())), original, nil
 }
 
-func (p *Processor) Convert(ctx context.Context, input io.Reader, output io.Writer) error {
+func (processor *Processor) Convert(ctx context.Context, input io.Reader, output io.Writer) (ProbeResult, error) {
 	if input == nil || output == nil {
-		return errors.New("ffmpeg: nil input or output")
+		return ProbeResult{}, errors.New("ffmpeg: nil input or output")
 	}
-	proc, err := p.convert.acquire(ctx)
+	process, err := processor.convert.acquire(ctx)
 	if err != nil {
-		return err
+		return ProbeResult{}, err
 	}
-	stopCancel := proc.watch(ctx)
+	stopCancel := process.watch(ctx)
 	copyErr := make(chan error, 1)
 	go func() {
-		_, e := io.Copy(proc.stdin, input)
-		if ce := proc.stdin.Close(); e == nil {
-			e = ce
+		_, copyError := io.Copy(process.stdin, input)
+		if closeError := process.stdin.Close(); copyError == nil {
+			copyError = closeError
 		}
-		copyErr <- e
+		copyErr <- copyError
 	}()
-	_, outputErr := io.Copy(output, proc.stdout)
+	countedOutput := &countingWriter{writer: output}
+	_, outputErr := io.Copy(countedOutput, process.stdout)
 	// A destination error must not leave the child blocked on a full stdout
 	// pipe while Wait waits for that child to exit.
 	if outputErr != nil {
-		_, _ = io.Copy(io.Discard, proc.stdout)
+		_, _ = io.Copy(io.Discard, process.stdout)
 	}
-	waitErr := proc.wait()
+	waitErr := process.wait()
 	stopCancel()
-	p.convert.finished(proc)
+	processor.convert.finished(process)
 	writeErr := <-copyErr
+	result := processor.target.result(countedOutput.written)
 	if outputErr != nil {
-		return fmt.Errorf("read ffmpeg output: %w", outputErr)
+		return result, fmt.Errorf("read ffmpeg output: %w", outputErr)
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return result, ctx.Err()
 	}
 	if waitErr != nil {
-		return fmt.Errorf("ffmpeg: %w%s", waitErr, proc.stderrSuffix())
+		return result, fmt.Errorf("ffmpeg: %w%s", waitErr, process.stderrSuffix())
 	}
 	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
-		return fmt.Errorf("write ffmpeg input: %w", writeErr)
+		return result, fmt.Errorf("write ffmpeg input: %w", writeErr)
 	}
-	return nil
+	return result, nil
 }
 
-func (p *Processor) Close() error {
-	p.closeOnce.Do(func() { p.probe.close(); p.convert.close() })
+func (processor *Processor) Close() error {
+	processor.closeOnce.Do(func() { processor.probe.close(); processor.convert.close() })
 	return nil
 }
 
 // NeedsSeekableInput is deliberately conservative. Unknown formats and the
 // MOV/MP4 family require a seekable source; known sequential formats do not.
-func NeedsSeekableInput(info Info) bool {
+func NeedsSeekableInput(info ProbeResult) bool {
 	streamable := map[string]bool{"wav": true, "mp3": true, "flac": true, "ogg": true, "opus": true, "aac": true, "adts": true, "webm": true, "matroska": true}
-	for _, name := range strings.Split(strings.ToLower(info.Format.Name), ",") {
+	for _, name := range strings.Split(strings.ToLower(info.FormatName), ",") {
 		if streamable[strings.TrimSpace(name)] {
 			return false
 		}
@@ -199,24 +213,142 @@ func NeedsSeekableInput(info Info) bool {
 	return true
 }
 
-// IsTargetFormat reports whether the first audio stream is mono, 16 kHz,
-// signed 16-bit little-endian PCM in a raw s16le container.
-func IsTargetFormat(info Info) bool {
+// IsTargetFormat reports whether the first audio stream already matches the
+// output format configured by the Processor's FFmpegArgs. It returns false
+// when the relevant output format or codec cannot be determined from the args.
+func (processor *Processor) IsTargetFormat(info ProbeResult) bool {
+	if processor == nil || processor.target.container == "" || processor.target.codec == "" {
+		return false
+	}
 	formatOK := false
-	for _, n := range strings.Split(strings.ToLower(info.Format.Name), ",") {
-		if strings.TrimSpace(n) == "s16le" {
+	for _, formatName := range strings.Split(strings.ToLower(info.FormatName), ",") {
+		if strings.TrimSpace(formatName) == processor.target.container {
 			formatOK = true
 		}
 	}
 	if !formatOK {
 		return false
 	}
-	for _, s := range info.Streams {
-		if s.CodecType == "audio" {
-			return s.CodecName == "pcm_s16le" && s.Channels == 1 && s.SampleRate == "16000"
+	return strings.EqualFold(info.codecName, processor.target.codec) &&
+		(processor.target.channels == 0 || info.NumChannels == processor.target.channels) &&
+		(processor.target.sampleRate == 0 || info.SampleRate == processor.target.sampleRate)
+}
+
+type outputFormat struct {
+	container  string
+	codec      string
+	channels   int
+	sampleRate int
+}
+
+func parseOutputFormat(args []string) outputFormat {
+	// Options before the final input apply to an input, not the output.
+	start := 0
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" {
+			start = i + 2
+			i++
 		}
 	}
-	return false
+	var target outputFormat
+	for i := start; i+1 < len(args); i++ {
+		value := strings.ToLower(args[i+1])
+		switch args[i] {
+		case "-f":
+			target.container = value
+			i++
+		case "-acodec", "-codec:a", "-c:a":
+			target.codec = canonicalCodec(value)
+			i++
+		case "-ac":
+			target.channels, _ = strconv.Atoi(value)
+			i++
+		case "-ar":
+			target.sampleRate, _ = strconv.Atoi(value)
+			i++
+		}
+	}
+	return target
+}
+
+func normalizeProbeInfo(info probeInfo, inputBytes int64) ProbeResult {
+	result := ProbeResult{FormatName: info.Format.Name, StreamIDs: make([]int, 0)}
+	result.Duration, _ = strconv.ParseFloat(info.Format.Duration, 64)
+	for _, stream := range info.Streams {
+		if stream.CodecType != "audio" {
+			continue
+		}
+		result.StreamIDs = append(result.StreamIDs, stream.Index)
+		if result.codecName == "" {
+			result.codecName = stream.CodecName
+			result.NumChannels = stream.Channels
+			result.SampleRate, _ = strconv.Atoi(stream.SampleRate)
+		}
+		if result.Duration == 0 {
+			streamDuration, _ := strconv.ParseFloat(stream.Duration, 64)
+			if streamDuration > result.Duration {
+				result.Duration = streamDuration
+			}
+		}
+	}
+	if result.Duration == 0 {
+		result.Duration = pcmDuration(inputBytes, result.codecName, result.NumChannels, result.SampleRate)
+		result.DurationEstimated = result.Duration > 0
+	}
+	return result
+}
+
+func (target outputFormat) result(outputBytes int64) ProbeResult {
+	result := ProbeResult{
+		NumChannels: target.channels,
+		StreamIDs:   []int{0},
+		FormatName:  target.container,
+		SampleRate:  target.sampleRate,
+		codecName:   target.codec,
+	}
+	result.Duration = pcmDuration(outputBytes, target.codec, target.channels, target.sampleRate)
+	result.DurationEstimated = result.Duration > 0
+	return result
+}
+
+func pcmDuration(byteCount int64, codec string, channels, sampleRate int) float64 {
+	bits := 0
+	if strings.HasPrefix(codec, "pcm_s") || strings.HasPrefix(codec, "pcm_u") || strings.HasPrefix(codec, "pcm_f") {
+		for _, width := range []int{8, 16, 24, 32, 64} {
+			if strings.Contains(codec, strconv.Itoa(width)) {
+				bits = width
+				break
+			}
+		}
+	}
+	if byteCount <= 0 || bits == 0 || channels <= 0 || sampleRate <= 0 {
+		return 0
+	}
+	return float64(byteCount) / float64(bits/8*channels*sampleRate)
+}
+
+type countingWriter struct {
+	writer  io.Writer
+	written int64
+}
+
+func (output *countingWriter) Write(data []byte) (int, error) {
+	written, err := output.writer.Write(data)
+	output.written += int64(written)
+	return written, err
+}
+
+func canonicalCodec(codec string) string {
+	switch codec {
+	case "libmp3lame":
+		return "mp3"
+	case "libopus":
+		return "opus"
+	case "libvorbis":
+		return "vorbis"
+	default:
+		return codec
+	}
 }
 
 type child struct {
@@ -226,12 +358,16 @@ type child struct {
 	stderr bytes.Buffer
 }
 
-func (c *child) watch(ctx context.Context) func() {
+// watch connects a job's context to a child that was started before the job
+// existed and therefore could not be created with exec.CommandContext. It
+// kills the child if the job is cancelled. The returned function disarms the
+// watcher after normal completion so it cannot kill an already-finished child.
+func (process *child) watch(ctx context.Context) func() {
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.cmd.Process.Kill()
+			_ = process.cmd.Process.Kill()
 		case <-done:
 		}
 	}()
@@ -239,29 +375,29 @@ func (c *child) watch(ctx context.Context) func() {
 }
 
 func startChild(command string, args []string) (*child, error) {
-	c := &child{}
-	c.cmd = exec.Command(command, args...)
-	c.cmd.Stderr = &c.stderr
+	process := &child{}
+	process.cmd = exec.Command(command, args...)
+	process.cmd.Stderr = &process.stderr
 	var err error
-	if c.stdin, err = c.cmd.StdinPipe(); err != nil {
+	if process.stdin, err = process.cmd.StdinPipe(); err != nil {
 		return nil, err
 	}
-	if c.stdout, err = c.cmd.StdoutPipe(); err != nil {
+	if process.stdout, err = process.cmd.StdoutPipe(); err != nil {
 		return nil, err
 	}
-	if err = c.cmd.Start(); err != nil {
+	if err = process.cmd.Start(); err != nil {
 		return nil, err
 	}
-	return c, nil
+	return process, nil
 }
 
-func (c *child) wait() error { return c.cmd.Wait() }
-func (c *child) stderrSuffix() string {
-	s := strings.TrimSpace(c.stderr.String())
-	if s == "" {
+func (process *child) wait() error { return process.cmd.Wait() }
+func (process *child) stderrSuffix() string {
+	stderr := strings.TrimSpace(process.stderr.String())
+	if stderr == "" {
 		return ""
 	}
-	return ": " + s
+	return ": " + stderr
 }
 
 type processPool struct {
@@ -279,107 +415,110 @@ type processPool struct {
 
 func newProcessPool(ctx context.Context, size int, command string, args []string) (*processPool, error) {
 	poolCtx, cancel := context.WithCancel(ctx)
-	p := &processPool{ctx: poolCtx, cancel: cancel, ready: make(chan *child, size), command: command, args: append([]string(nil), args...), children: make(map[*child]struct{})}
+	pool := &processPool{ctx: poolCtx, cancel: cancel, ready: make(chan *child, size), command: command, args: append([]string(nil), args...), children: make(map[*child]struct{})}
 	for i := 0; i < size; i++ {
-		c, err := startChild(command, args)
+		process, err := startChild(command, args)
 		if err != nil {
-			p.close()
+			pool.close()
 			return nil, err
 		}
-		p.track(c)
-		p.ready <- c
+		pool.track(process)
+		pool.ready <- process
 	}
-	return p, nil
+	return pool, nil
 }
 
-func (p *processPool) acquire(ctx context.Context) (*child, error) {
+func (pool *processPool) acquire(ctx context.Context) (*child, error) {
 	if ctx == nil {
 		return nil, errors.New("ffmpeg: nil context")
 	}
 	select {
-	case <-p.ctx.Done():
+	case <-pool.ctx.Done():
 		return nil, ErrClosed
 	default:
 	}
 	select {
-	case c := <-p.ready:
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			_ = c.stdin.Close()
-			_ = c.cmd.Process.Kill()
-			_ = c.cmd.Wait()
-			p.finished(c)
+	case process := <-pool.ready:
+		pool.mu.Lock()
+		// Close may begin after the initial context check but before this child
+		// is received. Do not hand an idle child to a new job during shutdown;
+		// remove it from tracking and reap it here instead.
+		if pool.closed {
+			pool.mu.Unlock()
+			_ = process.stdin.Close()
+			_ = process.cmd.Process.Kill()
+			_ = process.cmd.Wait()
+			pool.finished(process)
 			return nil, ErrClosed
 		}
-		p.wg.Add(1)
-		p.mu.Unlock()
-		go p.replace()
-		return c, nil
+		pool.wg.Add(1)
+		pool.mu.Unlock()
+		go pool.replace()
+		return process, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-p.ctx.Done():
+	case <-pool.ctx.Done():
 		return nil, ErrClosed
 	}
 }
 
-func (p *processPool) replace() {
-	defer p.wg.Done()
-	c, err := startChild(p.command, p.args)
+func (pool *processPool) replace() {
+	defer pool.wg.Done()
+	process, err := startChild(pool.command, pool.args)
 	if err != nil {
 		return
 	}
-	p.track(c)
+	pool.track(process)
 	select {
-	case p.ready <- c:
-	case <-p.ctx.Done():
-		_ = c.stdin.Close()
-		_ = c.cmd.Process.Kill()
-		_ = c.cmd.Wait()
-		p.finished(c)
+	case pool.ready <- process:
+	case <-pool.ctx.Done():
+		_ = process.stdin.Close()
+		_ = process.cmd.Process.Kill()
+		_ = process.cmd.Wait()
+		pool.finished(process)
 	}
 }
 
-func (p *processPool) track(c *child) {
-	p.mu.Lock()
-	p.children[c] = struct{}{}
-	p.childrenWG.Add(1)
-	p.mu.Unlock()
+func (pool *processPool) track(process *child) {
+	pool.mu.Lock()
+	pool.children[process] = struct{}{}
+	pool.childrenWG.Add(1)
+	pool.mu.Unlock()
 }
 
-func (p *processPool) finished(c *child) {
-	p.mu.Lock()
-	if _, ok := p.children[c]; ok {
-		delete(p.children, c)
-		p.childrenWG.Done()
+func (pool *processPool) finished(process *child) {
+	pool.mu.Lock()
+	if _, tracked := pool.children[process]; tracked {
+		delete(pool.children, process)
+		pool.childrenWG.Done()
 	}
-	p.mu.Unlock()
+	pool.mu.Unlock()
 }
 
-func (p *processPool) close() {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+func (pool *processPool) close() {
+	pool.mu.Lock()
+	if pool.closed {
+		pool.mu.Unlock()
 		return
 	}
-	p.closed = true
-	p.cancel()
-	p.mu.Unlock()
-	p.wg.Wait()
+	pool.closed = true
+	pool.cancel()
+	pool.mu.Unlock()
+	pool.wg.Wait()
 	for {
 		select {
-		case c := <-p.ready:
-			_ = c.stdin.Close()
-			_ = c.cmd.Process.Kill()
-			_ = c.cmd.Wait()
-			p.finished(c)
+		case process := <-pool.ready:
+			_ = process.stdin.Close()
+			_ = process.cmd.Process.Kill()
+			_ = process.cmd.Wait()
+			pool.finished(process)
 		default:
-			p.mu.Lock()
-			for c := range p.children {
-				_ = c.cmd.Process.Kill()
+			pool.mu.Lock()
+			for process := range pool.children {
+				_ = process.cmd.Process.Kill()
 			}
-			p.mu.Unlock()
-			p.childrenWG.Wait()
+			pool.mu.Unlock()
+			pool.childrenWG.Wait()
 			return
 		}
 	}
