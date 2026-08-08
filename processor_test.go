@@ -107,6 +107,32 @@ func TestConvertWAVDuration(t *testing.T) {
 	}
 }
 
+func TestConvertProbedFeedsPredictorAndMetrics(t *testing.T) {
+	requireFFmpeg(t)
+	predictor := NewRollingPredictor(PredictorConfig{MinSamples: 1})
+	var metrics ConvertMetrics
+	processor, err := NewProcessor(context.Background(), Config{
+		Predictor: predictor,
+		OnConvert: func(observed ConvertMetrics) { metrics = observed },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processor.Close()
+	inputInfo := ProbeResult{Duration: 0.01, FormatName: "wav", codecName: "pcm_s16le", NumChannels: 1, SampleRate: 16000}
+	var output bytes.Buffer
+	if _, err := processor.ConvertProbed(context.Background(), bytes.NewReader(tinyWAV()), &output, inputInfo); err != nil {
+		t.Fatal(err)
+	}
+	prediction, calibrated := processor.PredictConvert(inputInfo)
+	if !calibrated || prediction.Duration <= 0 || prediction.Samples != 1 {
+		t.Fatalf("unexpected prediction: %+v", prediction)
+	}
+	if !metrics.Successful || metrics.AudioType != inputInfo.AudioType() || metrics.AudioDuration != 0.01 || metrics.ProcessingDuration <= 0 || metrics.TotalDuration < metrics.ProcessingDuration {
+		t.Fatalf("unexpected metrics: %+v", metrics)
+	}
+}
+
 func TestPolicies(t *testing.T) {
 	for _, format := range []string{"wav", "mp3", "flac", "ogg", "opus", "aac", "adts", "webm", "matroska,webm"} {
 		if NeedsSeekableInput(ProbeResult{FormatName: format}) {

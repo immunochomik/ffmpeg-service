@@ -60,7 +60,7 @@ func process(ctx context.Context, input io.Reader) error {
 	}
 
 	var pcm bytes.Buffer
-	converted, err := processor.Convert(ctx, original, &pcm)
+	converted, err := processor.ConvertProbed(ctx, original, &pcm, info)
 	if err != nil {
 		return err
 	}
@@ -112,8 +112,8 @@ The helper reports policy only; it does not spool input automatically.
 type Config struct {
 	FFmpegCommand   string // default: ffmpeg
 	FFprobeCommand  string // default: ffprobe
-	FFmpegPoolSize  int    // default: 1
-	FFprobePoolSize int    // default: 1
+	FFmpegPoolSize  int    // default: 5
+	FFprobePoolSize int    // default: 5
 	FFmpegArgs      []string
 	FFprobeArgs     []string
 }
@@ -128,6 +128,39 @@ ffmpeg -hide_banner -loglevel error -i pipe:0 -ac 1 -ar 16000 \
 
 Acquisition waits when a pool is exhausted and respects context cancellation.
 Closing the processor terminates idle children and waits for them to be reaped.
+
+## Conversion load prediction
+
+An optional rolling predictor can learn conversion cost per input audio type:
+
+```go
+predictor := ffmpeg.NewRollingPredictor(ffmpeg.PredictorConfig{
+	Window:     5 * time.Minute,
+	Capacity:   128,
+	MaxKeys:    5,
+	MinSamples: 10,
+})
+processor, err := ffmpeg.NewProcessor(ctx, ffmpeg.Config{Predictor: predictor})
+
+prediction, calibrated := processor.PredictConvert(info)
+if calibrated && prediction.Duration > maximumAcceptableDuration {
+	// Send the job to a fallback worker. Keep admitting occasional work so this
+	// worker can observe recovery rather than remaining rejected forever.
+}
+result, err := processor.ConvertProbed(ctx, original, output, info)
+```
+
+Models expire samples outside the configured time window and retain at most
+`Capacity` samples. They use a robust linear estimate with a fixed-overhead
+term and a conservative residual allowance, keep failed/cancelled work out of
+training, expose current in-flight work, and adjust estimates when concurrency
+is above its recently observed level.
+Audio types are separated by container, codec, channels, and sample rate; only
+the five most recently used types are retained by default.
+
+`Config.OnConvert` can receive `ConvertMetrics`, which reports pool acquisition,
+processing, and total time separately. Prediction is deliberately advisory:
+the caller owns rejection thresholds, fallback routing, and recovery probes.
 
 ## Benchmarks
 

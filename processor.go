@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var ErrClosed = errors.New("ffmpeg: processor closed")
@@ -28,6 +29,12 @@ type Config struct {
 	// wrappers and testing; an empty (but non-nil) slice is respected.
 	FFmpegArgs  []string
 	FFprobeArgs []string
+
+	// Predictor is optional. When set, Convert records successful processing
+	// rates and PredictConvert can be used for admission decisions.
+	Predictor *RollingPredictor
+	// OnConvert receives timing details after every attempted conversion.
+	OnConvert func(ConvertMetrics)
 }
 
 type probeInfo struct {
@@ -70,6 +77,21 @@ type Processor struct {
 	convert   *processPool
 	target    outputFormat
 	closeOnce sync.Once
+	predictor *RollingPredictor
+	onConvert func(ConvertMetrics)
+}
+
+// ConvertMetrics separates pool saturation from actual media processing. A
+// slow destination can still affect ProcessingDuration because FFmpeg stdout
+// applies backpressure; callers should keep output destinations local/fast when
+// using this measurement as a CPU-overload signal.
+type ConvertMetrics struct {
+	AudioType          string
+	AudioDuration      float64
+	AcquireDuration    time.Duration
+	ProcessingDuration time.Duration
+	TotalDuration      time.Duration
+	Successful         bool
 }
 
 func NewProcessor(ctx context.Context, cfg Config) (*Processor, error) {
@@ -106,7 +128,7 @@ func NewProcessor(ctx context.Context, cfg Config) (*Processor, error) {
 		probe.close()
 		return nil, fmt.Errorf("start ffmpeg pool: %w", err)
 	}
-	return &Processor{probe: probe, convert: convert, target: parseOutputFormat(cfg.FFmpegArgs)}, nil
+	return &Processor{probe: probe, convert: convert, target: parseOutputFormat(cfg.FFmpegArgs), predictor: cfg.Predictor, onConvert: cfg.OnConvert}, nil
 }
 
 func (processor *Processor) Probe(ctx context.Context, input io.Reader) (ProbeResult, io.Reader, error) {
@@ -154,13 +176,53 @@ func (processor *Processor) Probe(ctx context.Context, input io.Reader) (ProbeRe
 }
 
 func (processor *Processor) Convert(ctx context.Context, input io.Reader, output io.Writer) (ProbeResult, error) {
+	return processor.convertWithInfo(ctx, input, output, ProbeResult{})
+}
+
+// ConvertProbed converts input while associating the measurement with its
+// probed duration and audio type. Use this form when predictions will be used
+// for admission control; Convert remains convenient when no Probe was needed.
+func (processor *Processor) ConvertProbed(ctx context.Context, input io.Reader, output io.Writer, inputInfo ProbeResult) (ProbeResult, error) {
+	return processor.convertWithInfo(ctx, input, output, inputInfo)
+}
+
+// PredictConvert estimates processing time for previously probed input. The
+// boolean is false while its audio-type model is still calibrating.
+func (processor *Processor) PredictConvert(inputInfo ProbeResult) (Prediction, bool) {
+	if processor == nil || processor.predictor == nil {
+		return Prediction{}, false
+	}
+	prediction := processor.predictor.Predict(inputInfo.AudioType(), inputInfo.Duration)
+	return prediction, prediction.Calibrated
+}
+
+func (processor *Processor) convertWithInfo(ctx context.Context, input io.Reader, output io.Writer, inputInfo ProbeResult) (result ProbeResult, returnErr error) {
 	if input == nil || output == nil {
 		return ProbeResult{}, errors.New("ffmpeg: nil input or output")
 	}
+	totalStarted := time.Now()
+	audioType := inputInfo.AudioType()
+	measurement := processor.predictor.Begin(audioType)
+	var acquireDuration, processingDuration time.Duration
+	defer func() {
+		work := inputInfo.Duration
+		if work <= 0 {
+			work = result.Duration
+		}
+		metrics := ConvertMetrics{AudioType: audioType, AudioDuration: work, AcquireDuration: acquireDuration, ProcessingDuration: processingDuration, TotalDuration: time.Since(totalStarted), Successful: returnErr == nil}
+		measurement.Finish(OperationSample{Work: work, Duration: processingDuration, Successful: returnErr == nil})
+		if processor.onConvert != nil {
+			processor.onConvert(metrics)
+		}
+	}()
+	acquireStarted := time.Now()
 	process, err := processor.convert.acquire(ctx)
+	acquireDuration = time.Since(acquireStarted)
 	if err != nil {
 		return ProbeResult{}, err
 	}
+	processingStarted := time.Now()
+	defer func() { processingDuration = time.Since(processingStarted) }()
 	stopCancel := process.watch(ctx)
 	copyErr := make(chan error, 1)
 	go func() {
@@ -181,7 +243,7 @@ func (processor *Processor) Convert(ctx context.Context, input io.Reader, output
 	stopCancel()
 	processor.convert.finished(process)
 	writeErr := <-copyErr
-	result := processor.target.result(countedOutput.written, countedOutput.prefix)
+	result = processor.target.result(countedOutput.written, countedOutput.prefix)
 	if outputErr != nil {
 		return result, fmt.Errorf("read ffmpeg output: %w", outputErr)
 	}
@@ -195,6 +257,18 @@ func (processor *Processor) Convert(ctx context.Context, input io.Reader, output
 		return result, fmt.Errorf("write ffmpeg input: %w", writeErr)
 	}
 	return result, nil
+}
+
+// AudioType creates a model key from the properties that most strongly
+// influence decoder cost. Container aliases are kept together as reported by
+// ffprobe; the predictor's LRU cap bounds unusual combinations.
+func (info ProbeResult) AudioType() string {
+	container := strings.ToLower(strings.TrimSpace(info.FormatName))
+	codec := strings.ToLower(strings.TrimSpace(info.codecName))
+	if container == "" && codec == "" {
+		return "unknown"
+	}
+	return fmt.Sprintf("%s/%s/%dch/%dhz", container, codec, info.NumChannels, info.SampleRate)
 }
 
 func (processor *Processor) Close() error {
