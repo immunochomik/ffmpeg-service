@@ -19,6 +19,14 @@ import (
 
 var ErrClosed = errors.New("ffmpeg: processor closed")
 
+func defaultFFmpegArgs() []string {
+	return []string{"-hide_banner", "-loglevel", "error", "-protocol_whitelist", "pipe", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le", "pipe:1"}
+}
+
+func defaultFFprobeArgs() []string {
+	return []string{"-v", "error", "-protocol_whitelist", "pipe", "-show_format", "-show_streams", "-of", "json", "pipe:0"}
+}
+
 type Config struct {
 	FFmpegCommand   string
 	FFprobeCommand  string
@@ -114,10 +122,10 @@ func NewProcessor(ctx context.Context, cfg Config) (*Processor, error) {
 		cfg.FFprobeCommand = "ffprobe"
 	}
 	if cfg.FFmpegArgs == nil {
-		cfg.FFmpegArgs = []string{"-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le", "pipe:1"}
+		cfg.FFmpegArgs = defaultFFmpegArgs()
 	}
 	if cfg.FFprobeArgs == nil {
-		cfg.FFprobeArgs = []string{"-v", "error", "-show_format", "-show_streams", "-of", "json", "pipe:0"}
+		cfg.FFprobeArgs = defaultFFprobeArgs()
 	}
 	probe, err := newProcessPool(ctx, cfg.FFprobePoolSize, cfg.FFprobeCommand, cfg.FFprobeArgs)
 	if err != nil {

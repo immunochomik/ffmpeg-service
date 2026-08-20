@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -83,6 +84,27 @@ func TestConvert(t *testing.T) {
 	}
 	if result.FormatName != "s16le" || result.NumChannels != 1 || result.SampleRate != 16000 || result.Duration != 0.01 || result.DurationEstimated {
 		t.Fatalf("unexpected conversion result: %+v", result)
+	}
+}
+
+func TestDefaultArgsRestrictInputProtocols(t *testing.T) {
+	for name, test := range map[string]struct {
+		args []string
+		want []string
+	}{
+		"ffmpeg":  {defaultFFmpegArgs(), []string{"-protocol_whitelist", "pipe", "-i", "pipe:0"}},
+		"ffprobe": {defaultFFprobeArgs(), []string{"-protocol_whitelist", "pipe", "-show_format"}},
+	} {
+		found := false
+		for index := 0; index+len(test.want) <= len(test.args); index++ {
+			if reflect.DeepEqual(test.args[index:index+len(test.want)], test.want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s args %q do not contain input restriction %q", name, test.args, test.want)
+		}
 	}
 }
 
