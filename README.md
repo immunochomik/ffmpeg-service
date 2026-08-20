@@ -7,6 +7,10 @@ request path while retaining process isolation between jobs.
 
 The package uses `os/exec`; it does not require libav or cgo.
 
+By default both child processes use FFmpeg's `-protocol_whitelist pipe` input
+option. This prevents media supplied through stdin from causing FFmpeg to open
+network URLs or local files referenced by a crafted playlist or manifest.
+
 ## Requirements
 
 - Go 1.23 or newer
@@ -119,10 +123,15 @@ type Config struct {
 }
 ```
 
+`FFmpegArgs` and `FFprobeArgs` replace the defaults when non-nil. Custom
+argument lists should retain `-protocol_whitelist pipe` before the input unless
+additional protocols are intentionally required.
+
 The default conversion is equivalent to:
 
 ```text
-ffmpeg -hide_banner -loglevel error -i pipe:0 -ac 1 -ar 16000 \
+ffmpeg -hide_banner -loglevel error -protocol_whitelist pipe -i pipe:0 \
+  -ac 1 -ar 16000 \
   -acodec pcm_s16le -f s16le pipe:1
 ```
 
